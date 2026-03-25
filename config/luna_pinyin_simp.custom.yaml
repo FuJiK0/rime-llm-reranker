@@ -1,0 +1,50 @@
+# luna_pinyin_simp.custom.yaml
+# 朙月拼音·简化字 - LLM 候选词重排序配置
+#
+# 放置路径：~/Library/Rime/luna_pinyin_simp.custom.yaml
+# 修改后需要重新部署 Rime（菜单栏 → 重新部署）
+
+patch:
+  # 将 LLM 过滤器插在 simplifier 之后（@before 1）
+  # 这样 LLM 看到的是已经转换好的简体候选词
+  engine/filters/@before 1: lua_filter@llm_reranker
+
+  llm_reranker:
+
+    # 是否启用（false 可临时关闭，恢复纯 n-gram 行为）
+    enabled: true
+
+    # oMLX API 地址（OpenAI 兼容格式）
+    endpoint: "http://localhost:8000/v1/chat/completions"
+
+    # 模型名称（在 oMLX 界面查看）
+    # 推荐：0.8B 模型流畅度最佳，2B+ 模型可能有延迟
+    model: "Qwen3.5-0.8B-MLX-bf16"
+
+    # 参与重排序的候选词数量
+    max_candidates: 5
+
+    # HTTP 超时（秒），超时后保留原始顺序
+    timeout: 0.5
+
+    # 送给 LLM 的上下文字数上限
+    context_length: 60
+
+    # 模型温度（0.0 = 确定性输出，推荐）
+    temperature: 0.0
+
+    # 模型最大输出 token 数
+    max_tokens: 10
+
+    # 去抖动：拼音长度少于此值时跳过 LLM
+    # 输入 "ni" 不调用，"nih" 以上才调用
+    min_preedit_len: 3
+
+    # 系统提示词
+    system_prompt: "你是中文输入法候选词排序助手。根据用户已输入的上下文，从候选词列表中选出语义最连贯的词，只输出该词本身，不要任何解释、标点或额外文字。"
+
+    # 出错时是否降级保留原始顺序（强烈建议保持 true）
+    fallback_on_error: true
+
+    # 调试日志（日志路径：~/Library/Rime/rime_llm.log）
+    debug_log: false
