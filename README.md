@@ -29,7 +29,7 @@ Rime 主线程
 | 依赖 | 说明 |
 |------|------|
 | macOS + Apple Silicon | M1/M2/M3/M4 均可 |
-| [Squirrel 1.x](https://github.com/rime/squirrel/releases) | 需要内置 librime-lua 插件 |
+| [Squirrel 1.x](https://github.com/rime/squirrel/releases) | 需要内置 librime-lua 插件 搭配[雾凇输入法]效果更好(https://github.com/iDvel/rime-ice) |
 | [oMLX](https://github.com/oliverphilcox/oMLX) | 本地 LLM 推理服务，OpenAI 兼容 API |
 | 中文模型 | 推荐 `Qwen3.5-0.8B-MLX-bf16`（流畅）或 `Qwen3.5-2B-OptiQ-4bit`（效果更好但略慢） |
 
