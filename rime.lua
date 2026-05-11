@@ -1,5 +1,5 @@
 -- rime.lua
--- rime-llm-reranker · 改进版 v3 + 训练数据采集（精确匹配 & 纯净数据）
+-- rime-llm-reranker · v5 手动上下文收集版
 
 -- ─── luasocket 路径注入（Apple Silicon Mac）─────────────
 local _home = os.getenv('HOME') or ''
@@ -149,11 +149,14 @@ local function get_config(env)
   }
 end
 
+-- ─── 模块级配置（由 filter 更新） ─────────────────────
+local _cfg = {}
+
 -- ─── 调试日志 ─────────────────────────────────────────────
 local LOG_PATH   = _home..'/Library/Rime/rime_llm.log'
 
-local function dlog(cfg, msg)
-  if not cfg.debug then return end
+local function dlog(msg)
+  if not _cfg.debug then return end
   local f = io.open(LOG_PATH,'a')
   if f then f:write(os.date('%H:%M:%S')..' '..msg..'\n'); f:close() end
 end
@@ -171,8 +174,8 @@ local function utf8_tail(s, max_bytes)
   return s:sub(start)
 end
 
-local function log_train_pair(cfg, context, pinyin, positive, negative, source)
-  if not cfg.collect_train then return end
+local function log_train_pair(context, pinyin, positive, negative, source)
+  if not _cfg.collect_train then return end
   if not positive or not negative or positive == negative then return end
   if positive == '' or negative == '' then return end
 
@@ -192,19 +195,24 @@ local function log_train_pair(cfg, context, pinyin, positive, negative, source)
   end
 end
 
--- 记录 LLM 排序的所有相邻 pair（仅当 preedit 不是纯简拼时才记录）
-local function log_llm_ranking_pairs(cfg, context, pinyin, ranked_texts)
-  if not cfg.collect_train then return end
+-- 记录 LLM 排序的所有相邻 pair（仅当 preedit 不是纯简拼且上下文足够长时才记录）
+local function log_llm_ranking_pairs(context, pinyin, ranked_texts)
+  if not _cfg.collect_train then return end
   if not ranked_texts or #ranked_texts < 2 then return end
 
-  -- 排除纯简拼（仅由辅音字母组成，如 xz / bj / cx）
+  -- 纯简拼过滤
   if pinyin:lower():match('^[bcdfghjklmnpqrstxyz]+$') then
-    dlog(cfg, 'TRAIN: skip jianpin '..pinyin)
+    dlog('TRAIN: skip jianpin '..pinyin)
     return
   end
+  -- 上下文太短过滤（可选，若希望不记录无上下文的 pair 就取消注释）
+  -- if not context or #context < _cfg.min_ctx_len then
+  --   dlog('TRAIN: skip empty/short context')
+  --   return
+  -- end
 
   for i = 1, #ranked_texts - 1 do
-    log_train_pair(cfg, context, pinyin, ranked_texts[i], ranked_texts[i+1], 'llm_rank')
+    log_train_pair(context, pinyin, ranked_texts[i], ranked_texts[i+1], 'llm_rank')
   end
 end
 
@@ -259,14 +267,14 @@ local function find_match(list, word)
   return nil
 end
 
--- ─── 解析 LLM 响应，只保留精确匹配的词，返回 (best_idx, ranked_texts) ──
+-- ─── 解析 LLM 响应 ───────────────────────────────────────
 local function extract_ranking(response, list)
   local content = json_extract_content(response)
   if not content then return nil, {} end
 
   local ranked_texts = {}
   local seen = {}
-  for word in content:gmatch('[^、，,；;\n]+') do
+  for word in content:gmatch('[^、,，;；\n]+') do
     word = word:match('^%s*(.-)%s*$') or word
     word = word:gsub('^[%d①②③%.、。%s]+', '')
     word = word:match('^%s*(.-)%s*$') or word
@@ -276,8 +284,7 @@ local function extract_ranking(response, list)
         table.insert(ranked_texts, list[idx].text)
         seen[word] = true
       else
-        -- 任何无法精确匹配的词，停止解析后续词（避免错误累积）
-        break
+        break  -- 无法精确匹配，停止解析
       end
     end
   end
@@ -324,12 +331,12 @@ local function query_llm(cfg, committed, preedit, cand_texts)
   local ms = (os.clock()-t0)*1000
 
   if not resp then
-    dlog(cfg, string.format('FAIL %.0fms %s', ms, tostring(err)))
+    dlog(string.format('FAIL %.0fms %s', ms, tostring(err)))
     return nil, ms
   end
 
   local content = json_extract_content(resp)
-  dlog(cfg, string.format('OK %.0fms → [%s] preedit=「%s」 ctx=「%s」',
+  dlog(string.format('OK %.0fms → [%s] preedit=「%s」 ctx=「%s」',
     ms, content or 'nil', preedit, committed:sub(-15)))
 
   return resp, ms
@@ -345,6 +352,7 @@ end
 
 -- ─── 模块级状态 ──────────────────────────────────────────
 local committed_buffer = ''
+local _last_commit_text = ''      -- 去重用
 local _logged          = false
 
 local _cache      = {}
@@ -353,17 +361,15 @@ local CACHE_MAX   = 300
 
 local _querying = {}
 
--- 训练快照：展示给用户的候选列表（已排序后的 top 部分）
-local _pending_snapshot = nil
+-- 训练快照：上一次展示给用户的候选列表
+local _last_snapshot = nil
 
 -- ─── 拼音完整性判断 ──────────────────────────────────────
 
--- 纯简拼检测
 local function is_jianpin(preedit)
   return preedit:lower():match('^[bcdfghjklmnpqrstxyz]+$') ~= nil
 end
 
--- 完整韵尾列表
 local COMPLETE_ENDINGS = {
   'ang','eng','ing','ong','ung',
   'ian','uan','uen','van',
@@ -381,19 +387,68 @@ local function preedit_ends_incomplete(preedit)
   return true
 end
 
+-- ─── 查找词语在有序列表中的位置 ─────────────────────────
+local function index_of(list, word)
+  for i, w in ipairs(list) do
+    if w == word then return i end
+  end
+  return nil
+end
+
+-- ─── 主动收集上下文（代替回调） ──────────────────────────
+local function update_context_from_history(env)
+  local latest = nil
+  pcall(function()
+    local hist = env.engine.context.commit_history
+    if hist and not hist:empty() then
+      local entry = hist:back()
+      if entry and entry.text then
+        latest = entry.text
+      end
+    end
+  end)
+
+  if latest and latest ~= '' and latest ~= _last_commit_text then
+    -- 发生了新的上屏
+    committed_buffer = utf8_tail(committed_buffer .. latest, 1200)
+    _last_commit_text = latest
+
+    dlog('COMMIT: '..latest..' | buf_len='..#committed_buffer)
+
+    -- 记录 user_select（利用最近一次快照）
+    local snap = _last_snapshot
+    if snap and snap.ordered_texts and #snap.ordered_texts >= 2 then
+      local user_pos = index_of(snap.ordered_texts, latest)
+      local top1 = snap.ordered_texts[1]
+      if user_pos and user_pos > 1 and latest ~= top1 then
+        log_train_pair(snap.context, snap.pinyin, latest, top1, 'user_select')
+        dlog('USER_SELECT: '..latest..' over '..top1..' for pinyin='..snap.pinyin)
+      end
+    end
+
+    -- 清空缓存，允许对新的上下文重新查询 LLM
+    _cache = {}
+    _cache_size = 0
+    _last_snapshot = nil
+  end
+end
+
 -- ─── Rime filter 入口 ────────────────────────────────────
 function llm_reranker(input, env)
   local all = {}
   for cand in input:iter() do table.insert(all, cand) end
 
-  local cfg = get_config(env)
+  _cfg = get_config(env)   -- 更新模块配置
 
-  if not _logged and cfg.debug then
-    dlog(cfg, 'v3 started, backend: '..(_socket_ok and 'luasocket' or 'curl'))
+  if not _logged and _cfg.debug then
+    dlog('v5 started, backend: '..(_socket_ok and 'luasocket' or 'curl'))
     _logged = true
   end
 
-  if not cfg.enabled or #all < 2 then
+  -- 主动收集上下文（必须在处理候选词之前）
+  update_context_from_history(env)
+
+  if not _cfg.enabled or #all < 2 then
     for _,c in ipairs(all) do yield(c) end
     return
   end
@@ -405,27 +460,27 @@ function llm_reranker(input, env)
   end)
 
   local syllables = count_syllables(preedit)
-  if syllables < cfg.min_syllables then
+  if syllables < _cfg.min_syllables then
     for _,c in ipairs(all) do yield(c) end
     return
   end
 
   local skip = false
   local ctx_bytes = committed_buffer:len()
-  if ctx_bytes < cfg.min_ctx_len then
+  if ctx_bytes < _cfg.min_ctx_len then
     skip = true
-    dlog(cfg, 'SKIP: no context ('..ctx_bytes..' bytes < '..cfg.min_ctx_len..')')
+    dlog('SKIP: no context ('..ctx_bytes..' bytes < '.._cfg.min_ctx_len..')')
   end
 
   local preedit_len = preedit:len()
-  if preedit_len > cfg.max_preedit_len then
+  if preedit_len > _cfg.max_preedit_len then
     skip = true
-    dlog(cfg, 'SKIP: preedit too long ('..preedit_len..' > '..cfg.max_preedit_len..')')
+    dlog('SKIP: preedit too long ('..preedit_len..' > '.._cfg.max_preedit_len..')')
   end
 
   local top, rest = {}, {}
   for i,c in ipairs(all) do
-    if i <= cfg.max_cands then table.insert(top,c)
+    if i <= _cfg.max_cands then table.insert(top,c)
     else                       table.insert(rest,c) end
   end
 
@@ -443,58 +498,70 @@ function llm_reranker(input, env)
       for _,c in ipairs(top) do table.insert(texts, c.text) end
 
       local resp = nil
-      local ctx_snapshot = utf8_tail(committed_buffer, cfg.ctx_len)
-      if cfg.fallback then
+      local ctx_snapshot = utf8_tail(committed_buffer, _cfg.ctx_len)
+      if _cfg.fallback then
         pcall(function()
-          resp = (query_llm(cfg, ctx_snapshot, preedit, texts))
+          resp = (query_llm(_cfg, ctx_snapshot, preedit, texts))
         end)
       else
-        resp = (query_llm(cfg, ctx_snapshot, preedit, texts))
+        resp = (query_llm(_cfg, ctx_snapshot, preedit, texts))
       end
 
       local raw_idx, ranked_texts = extract_ranking(resp or '', top)
 
-      -- 训练数据记录：仅当拼音非中间态且非简拼时记录
+      -- 训练数据记录
       if is_jianpin(preedit) or not preedit_ends_incomplete(preedit) then
-        log_llm_ranking_pairs(cfg, ctx_snapshot, preedit, ranked_texts)
+        log_llm_ranking_pairs(ctx_snapshot, preedit, ranked_texts)
       end
 
-      if raw_idx and raw_idx > cfg.max_rerank_pos then
-        dlog(cfg, string.format('FILTERED: rank %d > max %d, skip rerank',
-          raw_idx, cfg.max_rerank_pos))
+      if raw_idx and raw_idx > _cfg.max_rerank_pos then
+        dlog(string.format('FILTERED: rank %d > max %d, skip rerank',
+          raw_idx, _cfg.max_rerank_pos))
         raw_idx = nil
       end
 
-      cached = raw_idx or false
+      local ordered_texts = {}
+      if raw_idx then
+        for _,c in ipairs(reorder(top, raw_idx)) do table.insert(ordered_texts, c.text) end
+      else
+        for _,c in ipairs(top) do table.insert(ordered_texts, c.text) end
+      end
+
+      cached = {
+        idx = raw_idx or false,
+        texts = ordered_texts,
+      }
       _querying[cache_key] = nil
       if _cache_size >= CACHE_MAX then _cache={}; _cache_size=0 end
       _cache[cache_key] = cached
       _cache_size = _cache_size + 1
 
-      if cfg.debug then
-        if cached and cached > 1 then
-          dlog(cfg, 'RERANKED: '..top[1].text..' → '..top[cached].text)
+      if _cfg.debug then
+        if cached.idx and cached.idx > 1 then
+          dlog('RERANKED: '..top[1].text..' → '..top[cached.idx].text)
         else
-          dlog(cfg, 'NO_CHANGE: kept '..top[1].text)
+          dlog('NO_CHANGE: kept '..top[1].text)
         end
       end
     elseif _querying[cache_key] then
-      dlog(cfg, 'skip: query in progress '..cache_key)
+      dlog('skip: query in progress '..cache_key)
     else
-      dlog(cfg, 'cache hit ['..tostring(cached)..'] '..cache_key)
+      dlog('cache hit ['..tostring(cached and cached.idx)..'] '..cache_key)
     end
 
-    if cached ~= false then idx = cached end
+    if cached and cached.idx then
+      idx = cached.idx
+    end
   end
 
   local ordered = reorder(top, idx)
 
-  -- 保存快照用于 user_select 信号
-  if cfg.collect_train then
+  -- 保存快照供下次 user_select 使用
+  if _cfg.collect_train then
     local ordered_texts = {}
     for _, c in ipairs(ordered) do table.insert(ordered_texts, c.text) end
-    _pending_snapshot = {
-      context       = utf8_tail(committed_buffer, cfg.ctx_len),
+    _last_snapshot = {
+      context       = utf8_tail(committed_buffer, _cfg.ctx_len),
       pinyin        = preedit,
       ordered_texts = ordered_texts,
     }
@@ -506,100 +573,27 @@ end
 
 -- ─── init / fini ─────────────────────────────────────────
 function llm_reranker_init(env)
+  _cfg = get_config(env)
   committed_buffer  = ''
+  _last_commit_text = ''
   _logged           = false
   _cache            = {}
   _cache_size       = 0
   _querying         = {}
-  _pending_snapshot = nil
+  _last_snapshot    = nil
 
-  pcall(function()
-    env.commit_conn = env.engine.context.commit_notifier:connect(function(ctx)
-      local h = ctx.commit_history
-      if h and not h:empty() then
-        local last = h:back()
-        if last and last.text then
-          committed_buffer = utf8_tail(committed_buffer..last.text, 1200)
-          _cache = {}
-          _cache_size = 0
-        end
-      end
-    end)
-  end)
+  dlog('INIT done (v5)')
 end
 
 function llm_reranker_fini(env)
-  if env.commit_conn then
-    pcall(function() env.commit_conn:disconnect() end)
-  end
   committed_buffer  = ''
+  _last_commit_text = ''
   _cache            = {}
   _cache_size       = 0
-  _pending_snapshot = nil
+  _last_snapshot    = nil
 end
 
--- ─── Context Tracker Processor（记录用户覆盖信号）─────────
-local _last_commit_text = ''
-
-local function read_latest_commit(env)
-  local text = nil
-  pcall(function()
-    local hist = env.engine.context.commit_history
-    if hist and not hist:empty() then
-      local entry = hist:back()
-      if entry and entry.text then text = entry.text end
-    end
-  end)
-  return text
-end
-
--- 查找词语在有序列表中的位置（从1开始）
-local function index_of(list, word)
-  for i, w in ipairs(list) do
-    if w == word then return i end
-  end
-  return nil
-end
-
+-- 废弃的按键处理器（保留空函数）
 function llm_context_tracker(key_event, env)
-  local kNoop = 2
-
-  local keycode = key_event.keycode
-  local is_commit_key = (keycode == 32)
-    or (keycode >= 49 and keycode <= 53)
-    or (keycode == 65293 or keycode == 65421)
-
-  if is_commit_key then
-    local latest = read_latest_commit(env)
-    if latest and latest ~= _last_commit_text then
-      _last_commit_text = latest
-
-      local snap = _pending_snapshot
-      if snap and snap.ordered_texts and #snap.ordered_texts >= 2 then
-        local user_pos = index_of(snap.ordered_texts, latest)
-        local top1 = snap.ordered_texts[1]
-        -- 只要用户选择的不是第一候选，就记录 pair (latest > top1)
-        if user_pos and user_pos > 1 and latest ~= top1 then
-          local record = json_encode({
-            context  = snap.context,
-            pinyin   = snap.pinyin,
-            positive = latest,
-            negative = top1,
-            source   = 'user_select',
-          })
-          if record then
-            local f = io.open(TRAIN_LOG_PATH, 'a')
-            if f then f:write(record..'\n'); f:close() end
-          end
-        end
-      end
-
-      _pending_snapshot = nil
-      committed_buffer = utf8_tail(committed_buffer .. latest, 1200)
-      _cache = {}
-      _cache_size = 0
-    end
-  end
-
-  return kNoop
+  return 2  -- kNoop
 end
